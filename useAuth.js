@@ -2,56 +2,56 @@ import { useState, useEffect, useCallback } from "react";
 import { supabase } from "./supabase";
 
 export function useAuth() {
-  const [user, setUser] = useState(null);       // Supabase Auth user
-  const [perfil, setPerfil] = useState(null);    // { rol, ejecutivo_id, nombre_display, activo }
+  const [user, setUser] = useState(null);
+  const [perfil, setPerfil] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // ─── Cargar perfil del usuario ───
   const fetchPerfil = useCallback(async (userId) => {
-    const { data, error: err } = await supabase
-      .from("perfiles")
-      .select("*")
-      .eq("user_id", userId)
-      .single();
+    try {
+      const { data, error: err } = await supabase
+        .from("perfiles")
+        .select("*")
+        .eq("user_id", userId)
+        .maybeSingle();
 
-    if (err) {
-      console.error("Error al cargar perfil:", err.message);
-      setError("No se encontró tu perfil. Contacta al administrador.");
-      setPerfil(null);
-      return null;
+      if (err) {
+        console.error("Error perfil:", err.message);
+        return { data: null, error: err.message };
+      }
+
+      if (!data) {
+        return { data: null, error: "No se encontró tu perfil" };
+      }
+
+      if (!data.activo) {
+        await supabase.auth.signOut();
+        return { data: null, error: "Tu cuenta está desactivada" };
+      }
+
+      setPerfil(data);
+      setError(null);
+      return { data, error: null };
+    } catch (e) {
+      console.error("Exception perfil:", e);
+      return { data: null, error: e.message };
     }
-
-    if (!data.activo) {
-      setError("Tu cuenta está desactivada. Contacta al administrador.");
-      await supabase.auth.signOut();
-      setPerfil(null);
-      return null;
-    }
-
-    setPerfil(data);
-    setError(null);
-    return data;
   }, []);
 
-  // ─── Escuchar cambios de sesión ───
   useEffect(() => {
-    // Checar sesión existente
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
       if (session?.user) {
         setUser(session.user);
-        fetchPerfil(session.user.id).finally(() => setLoading(false));
-      } else {
-        setLoading(false);
+        const result = await fetchPerfil(session.user.id);
+        if (result.data) setPerfil(result.data);
       }
+      setLoading(false);
     });
 
-    // Listener de cambios
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
         if (event === "SIGNED_IN" && session?.user) {
           setUser(session.user);
-          await fetchPerfil(session.user.id);
         } else if (event === "SIGNED_OUT") {
           setUser(null);
           setPerfil(null);
@@ -62,90 +62,81 @@ export function useAuth() {
     return () => subscription.unsubscribe();
   }, [fetchPerfil]);
 
-  // ─── Login ───
   const login = async (email, password) => {
     setError(null);
-    const { data, error: err } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+    try {
+      const { data, error: err } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
 
-    if (err) {
-      if (err.message.includes("Invalid login")) {
-        setError("Email o contraseña incorrectos");
-      } else {
-        setError(err.message);
+      if (err) {
+        const msg = err.message.includes("Invalid login")
+          ? "Email o contraseña incorrectos"
+          : err.message;
+        setError(msg);
+        return { success: false, error: msg };
       }
-      return { success: false, error: err.message };
-    }
 
-    const p = await fetchPerfil(data.user.id);
-    return { success: !!p, perfil: p };
+      // Small delay to ensure session is fully set
+      await new Promise((r) => setTimeout(r, 300));
+
+      const result = await fetchPerfil(data.user.id);
+
+      if (result.error) {
+        // Retry once after another delay
+        await new Promise((r) => setTimeout(r, 500));
+        const retry = await fetchPerfil(data.user.id);
+        if (retry.error) {
+          setError(retry.error);
+          return { success: false, error: retry.error };
+        }
+        setPerfil(retry.data);
+        return { success: true, perfil: retry.data };
+      }
+
+      setPerfil(result.data);
+      return { success: true, perfil: result.data };
+    } catch (e) {
+      setError(e.message);
+      return { success: false, error: e.message };
+    }
   };
 
-  // ─── Logout ───
   const logout = async () => {
     await supabase.auth.signOut();
     setUser(null);
     setPerfil(null);
   };
 
-  // ─── Reset password ───
   const resetPassword = async (email) => {
     const { error: err } = await supabase.auth.resetPasswordForEmail(email);
     if (err) return { success: false, error: err.message };
     return { success: true };
   };
 
-  // ─── Create user (admin only) ───
   const createUser = async ({ email, password, nombre, rol, ejecutivo_id }) => {
-    // Usa la función admin de Supabase para crear usuarios
-    // Nota: en producción se usa una Edge Function o supabase.auth.admin
-    // Por ahora usamos signUp + metadatos
     const { data, error: err } = await supabase.auth.signUp({
       email,
       password,
-      options: {
-        data: {
-          nombre_display: nombre,
-          rol: rol,
-        },
-      },
+      options: { data: { nombre_display: nombre, rol } },
     });
-
     if (err) return { success: false, error: err.message };
-
-    // Actualizar el perfil con el ejecutivo_id si es ejecutivo
     if (rol === "ejecutivo" && ejecutivo_id) {
-      await supabase
-        .from("perfiles")
-        .update({ ejecutivo_id, rol: "ejecutivo" })
-        .eq("user_id", data.user.id);
+      await supabase.from("perfiles").update({ ejecutivo_id, rol: "ejecutivo" }).eq("user_id", data.user.id);
     }
-
-    // Si es admin, asegurar rol admin
     if (rol === "admin") {
-      await supabase
-        .from("perfiles")
-        .update({ rol: "admin" })
-        .eq("user_id", data.user.id);
+      await supabase.from("perfiles").update({ rol: "admin" }).eq("user_id", data.user.id);
     }
-
     return { success: true, user: data.user };
   };
 
   return {
-    user,
-    perfil,
-    loading,
-    error,
+    user, perfil, loading, error,
     isAdmin: perfil?.rol === "admin",
     isEjecutivo: perfil?.rol === "ejecutivo",
     ejecutivoId: perfil?.ejecutivo_id,
     nombreDisplay: perfil?.nombre_display || "",
-    login,
-    logout,
-    resetPassword,
-    createUser,
+    login, logout, resetPassword, createUser,
   };
 }
